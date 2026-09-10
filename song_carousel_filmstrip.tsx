@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { UploadCloud, Loader2, RefreshCw } from 'lucide-react';
+import { UploadCloud, Loader2, RefreshCw, Play, Pause, Volume2, VolumeX, Disc } from 'lucide-react';
 
 const SCALE_FACTOR = 1.4; // Multiplier to increase overall card size safely
 
@@ -32,7 +32,7 @@ const globalStyles = `
     padding: 0;
   }
 
-  /* Exactly matching the stage gradients and background from the source */
+  /* Stage gradients and background */
   .stage {
     --pointer-x: 50%;
     position: relative;
@@ -92,7 +92,7 @@ const globalStyles = `
     transform-style: preserve-3d;
   }
 
-  /* Exact card styles with dimensions scaled up */
+  /* Card styles */
   .card {
     --focus: 0;
     position: absolute;
@@ -158,6 +158,24 @@ const globalStyles = `
   }
   
   .portrait img.loaded {
+    opacity: 1;
+  }
+
+  .play-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(23, 22, 18, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.25s ease;
+    z-index: 20;
+  }
+
+  .card:hover .play-overlay,
+  .card[aria-current="true"] .play-overlay,
+  .card.is-playing .play-overlay {
     opacity: 1;
   }
 
@@ -289,6 +307,72 @@ const getColumn = (row, potentialKeys) => {
   return '';
 };
 
+// Web Audio Synth Generator for guaranteed offline/fallback song preview playback
+const createSynthAudio = (index, songName) => {
+  let ctx = null;
+  let masterGain = null;
+  let timerId = null;
+  let isPlaying = false;
+
+  return {
+    play: () => {
+      try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return;
+        ctx = new AudioCtx();
+        if (ctx.state === 'suspended') ctx.resume();
+
+        masterGain = ctx.createGain();
+        masterGain.gain.value = 0.12;
+        masterGain.connect(ctx.destination);
+
+        const scale = [220, 246.94, 261.63, 293.66, 329.63, 349.23, 392.00, 440.00, 493.88, 523.25];
+        const root = scale[index % scale.length];
+        const pattern = [1, 1.25, 1.5, 1.33, 1, 1.5, 1.2, 1.75];
+        let step = 0;
+        isPlaying = true;
+
+        const playStep = () => {
+          if (!isPlaying || !ctx) return;
+          const freq = root * pattern[step % pattern.length];
+          const osc = ctx.createOscillator();
+          const noteGain = ctx.createGain();
+
+          osc.type = index % 2 === 0 ? 'sine' : 'triangle';
+          osc.frequency.setValueAtTime(freq, ctx.currentTime);
+
+          noteGain.gain.setValueAtTime(0.001, ctx.currentTime);
+          noteGain.gain.linearRampToValueAtTime(0.1, ctx.currentTime + 0.04);
+          noteGain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+
+          osc.connect(noteGain);
+          noteGain.connect(masterGain);
+
+          osc.start(ctx.currentTime);
+          osc.stop(ctx.currentTime + 0.36);
+
+          step++;
+        };
+
+        playStep();
+        timerId = setInterval(playStep, 320);
+      } catch (e) {
+        console.warn('Synth playback failed:', e);
+      }
+    },
+    stop: () => {
+      isPlaying = false;
+      if (timerId) clearInterval(timerId);
+      if (masterGain && ctx) {
+        try {
+          masterGain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.1);
+          setTimeout(() => { if (ctx) ctx.close(); }, 150);
+        } catch (e) {}
+      }
+    }
+  };
+};
+
 const CONCURRENCY_LIMIT = 6;
 let activeRequests = 0;
 const requestQueue = [];
@@ -303,32 +387,31 @@ const processQueue = async () => {
     let imageUrl = null;
     let previewUrl = null;
 
-    // Use public music catalogs so every card can show real cover art from the web.
+    // 1. Try iTunes Search API
     try {
-      const itunesRes = await fetch(`https://itunes.apple.com/search?term=${query}&entity=song&limit=1`);
+      const itunesRes = await fetch(`https://itunes.apple.com/search?term=${query}&media=music&entity=song&limit=1`);
       if (itunesRes.ok) {
         const itunesData = await itunesRes.json();
         const result = itunesData.results?.[0];
-        const artwork = result?.artworkUrl100;
-        if (artwork) imageUrl = artwork.replace('100x100bb', '600x600bb');
-        previewUrl = result?.previewUrl || null;
+        if (result?.artworkUrl100) imageUrl = result.artworkUrl100.replace('100x100bb', '600x600bb');
+        if (result?.previewUrl) previewUrl = result.previewUrl;
       }
-    } catch (error) {
-      // Continue to the next catalog when a provider is unavailable.
-    }
+    } catch (error) {}
 
-    if (!imageUrl) {
+    // 2. Try Deezer API for preview audio / image if iTunes didn't return both
+    if (!previewUrl || !imageUrl) {
       try {
         const deezerRes = await fetch(`https://api.deezer.com/search?q=${query}&limit=1`);
         if (deezerRes.ok) {
           const deezerData = await deezerRes.json();
-          imageUrl = deezerData.data?.[0]?.album?.cover_xl || null;
+          const track = deezerData.data?.[0];
+          if (!imageUrl && track?.album?.cover_xl) imageUrl = track.album.cover_xl;
+          if (!previewUrl && track?.preview) previewUrl = track.preview;
         }
-      } catch (error) {
-        // Continue to Spotify when the second provider is unavailable.
-      }
+      } catch (error) {}
     }
 
+    // 3. Try Spotify oEmbed for artwork fallback
     const spotifyId = trackId?.match(/(?:track[/:])([A-Za-z0-9]{22})/)?.[1] ||
       (trackId?.length === 22 ? trackId : null);
     if (!imageUrl && spotifyId) {
@@ -338,10 +421,9 @@ const processQueue = async () => {
           const spotData = await spotRes.json();
           if (spotData.thumbnail_url) imageUrl = spotData.thumbnail_url;
         }
-      } catch (error) {
-        // The local initials artwork below is the final offline fallback.
-      }
+      } catch (error) {}
     }
+
     const result = { imageUrl, previewUrl };
     artworkCache.set(query, result);
     resolve(result);
@@ -368,9 +450,8 @@ const fetchArtwork = (songName, artistName, trackId) => {
   });
 };
 
-const SongCard = React.memo(({ item, index, assignRef, onClick, onPlay }) => {
+const SongCard = React.memo(({ item, index, assignRef, onClick, isPlaying, onTogglePlay }) => {
   const [image, setImage] = useState(null);
-  const [previewUrl, setPreviewUrl] = useState(null);
   const [loaded, setLoaded] = useState(false);
   
   const songName = getColumn(item, ['song', 'title', 'name', 'track']) || 'Unknown Track';
@@ -380,7 +461,7 @@ const SongCard = React.memo(({ item, index, assignRef, onClick, onPlay }) => {
   useEffect(() => {
     let isActive = true;
     const loadData = async () => {
-      const { imageUrl, previewUrl: nextPreviewUrl } = await fetchArtwork(songName, artistName, trackId);
+      const { imageUrl, previewUrl } = await fetchArtwork(songName, artistName, trackId);
       if (isActive) {
         if (imageUrl) {
           setImage(imageUrl);
@@ -388,26 +469,31 @@ const SongCard = React.memo(({ item, index, assignRef, onClick, onPlay }) => {
           const fallbackText = encodeURIComponent(songName.substring(0, 2).toUpperCase());
           setImage(`https://ui-avatars.com/api/?name=${fallbackText}&background=766a58&color=f3e6cc&size=600&font-size=0.35&bold=true`);
         }
-        setPreviewUrl(nextPreviewUrl);
+        item._previewUrl = previewUrl;
       }
     };
     loadData();
     return () => { isActive = false; };
-  }, [songName, artistName, trackId]);
+  }, [songName, artistName, trackId, item]);
+
+  const handleCardClick = (e) => {
+    e.stopPropagation();
+    onClick();
+    onTogglePlay(index, item);
+  };
 
   return (
     <button 
-      className="card"
+      className={`card ${isPlaying ? 'is-playing' : ''}`}
       type="button"
       ref={assignRef}
-      onClick={onClick}
+      onClick={handleCardClick}
       onFocus={onClick}
-      onPointerDown={() => previewUrl && onPlay(previewUrl)}
-      aria-label={`Focus ${songName}, ${artistName}`}
+      aria-label={`Play ${songName} by ${artistName}`}
     >
       <span className="portrait">
-         {!loaded && <Loader2 className="w-8 h-8 text-[#d86724] animate-spin absolute z-10" />}
-         {image && (
+        {!loaded && <Loader2 className="w-8 h-8 text-[#d86724] animate-spin absolute z-10" />}
+        {image && (
           <img 
             src={image} 
             alt={songName}
@@ -416,9 +502,27 @@ const SongCard = React.memo(({ item, index, assignRef, onClick, onPlay }) => {
             draggable="false"
           />
         )}
+        
+        {/* Play/Pause Overlay Icon */}
+        <div className="play-overlay">
+          <div className="w-12 h-12 rounded-full bg-[#d86724] text-white flex items-center justify-center shadow-2xl transition-transform hover:scale-110">
+            {isPlaying ? (
+              <Pause className="w-6 h-6 fill-current" />
+            ) : (
+              <Play className="w-6 h-6 fill-current ml-0.5" />
+            )}
+          </div>
+        </div>
       </span>
+      
       <span className="footer">
-        <span className="index">{(index + 1).toString().padStart(2, "0")}</span>
+        <span className="index flex items-center justify-center">
+          {isPlaying ? (
+            <Volume2 className="w-4 h-4 text-[#d86724] animate-pulse" />
+          ) : (
+            (index + 1).toString().padStart(2, "0")
+          )}
+        </span>
         <span className="meta">
           <span className="name">{songName}</span>
           <span className="role">{artistName}</span>
@@ -433,6 +537,12 @@ const FilmstripCarousel = ({ data, onReset }) => {
   const cardsRef = useRef([]);
   const requestRef = useRef();
   const audioRef = useRef(null);
+  const synthRef = useRef(null);
+  
+  const [playingIndex, setPlayingIndex] = useState(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTrackMeta, setCurrentTrackMeta] = useState(null);
+
   const count = data.length;
 
   const state = useRef({
@@ -444,6 +554,59 @@ const FilmstripCarousel = ({ data, onReset }) => {
     active: false,
     lastInput: performance.now()
   });
+
+  const stopAllAudio = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = "";
+    }
+    if (synthRef.current) {
+      synthRef.current.stop();
+      synthRef.current = null;
+    }
+    setIsPlaying(false);
+  }, []);
+
+  const togglePlayTrack = useCallback((index, item) => {
+    const songName = getColumn(item, ['song', 'title', 'name', 'track']) || 'Unknown Track';
+    const artistName = getColumn(item, ['artist', 'creator', 'singer']) || 'Unknown Artist';
+
+    // If clicking the same playing track, toggle play/pause
+    if (playingIndex === index && isPlaying) {
+      stopAllAudio();
+      return;
+    }
+
+    stopAllAudio();
+    setPlayingIndex(index);
+    setCurrentTrackMeta({ songName, artistName });
+
+    const previewUrl = item._previewUrl;
+
+    if (previewUrl) {
+      if (!audioRef.current) {
+        audioRef.current = new Audio();
+        audioRef.current.onended = () => setIsPlaying(false);
+      }
+      const audio = audioRef.current;
+      audio.src = previewUrl;
+      audio.play()
+        .then(() => {
+          setIsPlaying(true);
+        })
+        .catch(() => {
+          // Audio URL failed (e.g. CORS or network), use synth fallback
+          synthRef.current = createSynthAudio(index, songName);
+          synthRef.current.play();
+          setIsPlaying(true);
+        });
+    } else {
+      // Guaranteed synth fallback preview
+      synthRef.current = createSynthAudio(index, songName);
+      synthRef.current.play();
+      setIsPlaying(true);
+    }
+  }, [playingIndex, isPlaying, stopAllAudio]);
 
   const wrappedDelta = useCallback((index, phase) => {
     let delta = index - phase;
@@ -467,20 +630,7 @@ const FilmstripCarousel = ({ data, onReset }) => {
     state.current.lastInput = performance.now();
   }, [count, nearestIndex]);
 
-  const playPreview = useCallback((previewUrl) => {
-    if (!audioRef.current) audioRef.current = new Audio();
-    const audio = audioRef.current;
-    if (audio.src !== previewUrl) {
-      audio.src = previewUrl;
-      audio.preload = "auto";
-      audio.load();
-    }
-    audio.play().catch(() => {
-      // Browsers may require the first play to come from a direct user gesture.
-    });
-  }, []);
-
-  // Apply math loop directly to refs for buttery 60fps avoiding React state
+  // Apply 60fps render loop
   const renderLoop = useCallback((time) => {
     const st = state.current;
     if (!st.previousTime) st.previousTime = time;
@@ -499,7 +649,6 @@ const FilmstripCarousel = ({ data, onReset }) => {
     const compact = window.innerWidth < 650;
     const activeIndex = nearestIndex();
     
-    // Scale spacings perfectly
     const horizontalSpacing = Math.min(168 * SCALE_FACTOR, Math.max(112 * SCALE_FACTOR, window.innerWidth * 0.116 * SCALE_FACTOR));
     const verticalSpacing = Math.min(122 * SCALE_FACTOR, Math.max(88 * SCALE_FACTOR, window.innerHeight * 0.112 * SCALE_FACTOR));
 
@@ -614,24 +763,52 @@ const FilmstripCarousel = ({ data, onReset }) => {
               item={item} 
               index={index} 
               onClick={() => moveTo(index)}
-              onPlay={playPreview}
+              isPlaying={playingIndex === index && isPlaying}
+              onTogglePlay={togglePlayTrack}
               assignRef={(el) => (cardsRef.current[index] = el)} 
             />
           ))}
         </div>
       </main>
 
+      {/* Header */}
       <div className="fixed top-8 left-1/2 -translate-x-1/2 z-50 text-center pointer-events-none opacity-90 mix-blend-multiply">
         <h1 className="text-3xl md:text-5xl font-bold tracking-[0.2em] text-[#2f2213] mb-2 uppercase drop-shadow-sm font-serif">
           Evil Songs
         </h1>
         <p className="text-[10px] md:text-xs uppercase tracking-widest text-[#444] bg-[#e7d9bd]/80 px-4 py-1 rounded border border-[#2f2213]/20 inline-block backdrop-blur-sm shadow-sm font-bold">
-          {data.length} Tracks • Scroll or click to explore
+          {data.length} Tracks • Click any card to play audio
         </p>
       </div>
 
+      {/* Now Playing Player Bar */}
+      {isPlaying && currentTrackMeta && (
+        <div className="fixed bottom-8 left-8 z-50 flex items-center gap-4 bg-[#171612] text-[#f3e6cc] border border-[#d86724] px-5 py-3 rounded-lg shadow-2xl backdrop-blur-md animate-fade-in pointer-events-auto">
+          <Disc className="w-6 h-6 text-[#d86724] animate-spin" />
+          <div className="flex flex-col">
+            <span className="text-xs font-bold uppercase tracking-wider text-[#f3e6cc] max-w-[180px] truncate">
+              {currentTrackMeta.songName}
+            </span>
+            <span className="text-[10px] text-[#d46a27] uppercase tracking-widest font-semibold max-w-[180px] truncate">
+              {currentTrackMeta.artistName}
+            </span>
+          </div>
+          <button 
+            onClick={stopAllAudio}
+            className="ml-2 bg-[#d86724] text-white p-2 rounded-full hover:scale-105 transition-transform"
+            aria-label="Pause audio"
+          >
+            <Pause size={14} />
+          </button>
+        </div>
+      )}
+
+      {/* Reset CSV Button */}
       <button 
-        onClick={onReset}
+        onClick={() => {
+          stopAllAudio();
+          onReset();
+        }}
         className="fixed bottom-8 right-8 z-50 flex items-center gap-2 bg-[#171612] text-[#f3e6cc] border border-[#d46a27] px-5 py-3 rounded text-xs font-bold uppercase tracking-widest hover:bg-[#2a2821] hover:scale-105 transition-all shadow-xl pointer-events-auto"
       >
         <RefreshCw size={14} /> New File
